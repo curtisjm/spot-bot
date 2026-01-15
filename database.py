@@ -116,3 +116,11 @@ async def get_user_stats(user_id: int) -> tuple[int, int]:
         times_mentioned = receiver_row[0] if receiver_row else 0
 
         return messages_sent, times_mentioned
+
+
+async def clear_stats():
+    """Clear all mention tracking data."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("DELETE FROM mention_senders")
+        await db.execute("DELETE FROM mention_receivers")
+        await db.commit()

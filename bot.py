@@ -216,6 +216,55 @@ async def stats(interaction: discord.Interaction, user: discord.Member):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
+@bot.tree.command(name="backfill", description="Import all existing messages from the spotted channel")
+@app_commands.default_permissions(administrator=True)
+async def backfill(interaction: discord.Interaction):
+    spotted_channel_id = await db.get_config("spotted_channel_id")
+    if not spotted_channel_id:
+        await interaction.response.send_message(
+            "No spotted channel configured. Use `/setup spotted #channel` first.",
+            ephemeral=True
+        )
+        return
+
+    channel = bot.get_channel(int(spotted_channel_id))
+    if not channel:
+        await interaction.response.send_message(
+            "Could not find the spotted channel.",
+            ephemeral=True
+        )
+        return
+
+    await interaction.response.defer(ephemeral=True)
+
+    # Clear existing data
+    await db.clear_stats()
+
+    # Fetch and process all messages
+    message_count = 0
+    async for message in channel.history(limit=None):
+        if message.author.bot:
+            continue
+        if not message.mentions:
+            continue
+
+        await db.increment_sender(message.author.id, message.author.display_name)
+        for mentioned_user in message.mentions:
+            if not mentioned_user.bot:
+                await db.increment_receiver(
+                    mentioned_user.id, mentioned_user.display_name
+                )
+        message_count += 1
+
+    # Update the leaderboard
+    await update_leaderboard(bot)
+
+    await interaction.followup.send(
+        f"Backfill complete! Processed {message_count} messages with mentions.",
+        ephemeral=True
+    )
+
+
 if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("Error: DISCORD_TOKEN not set in .env file")
