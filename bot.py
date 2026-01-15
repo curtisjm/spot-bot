@@ -1,0 +1,223 @@
+import discord
+from discord import app_commands
+from discord.ext import tasks
+import database as db
+from config import (
+    DISCORD_TOKEN,
+    LEADERBOARD_UPDATE_INTERVAL,
+    LEADERBOARD_SIZE,
+)
+
+
+class SpotBot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+
+    async def setup_hook(self):
+        await db.init_db()
+        await self.tree.sync()
+        self.update_leaderboard_task.start()
+
+    @tasks.loop(seconds=LEADERBOARD_UPDATE_INTERVAL)
+    async def update_leaderboard_task(self):
+        """Periodically update the leaderboard."""
+        await self.wait_until_ready()
+        await update_leaderboard(self)
+
+    async def on_ready(self):
+        print(f"Logged in as {self.user}")
+
+
+bot = SpotBot()
+
+
+@bot.event
+async def on_message(message: discord.Message):
+    # Ignore bot messages
+    if message.author.bot:
+        return
+
+    # Get the configured spotted channel
+    spotted_channel_id = await db.get_config("spotted_channel_id")
+    if not spotted_channel_id:
+        return
+
+    # Only track messages in the spotted channel
+    if str(message.channel.id) != spotted_channel_id:
+        return
+
+    # Check if message has user mentions
+    if not message.mentions:
+        return
+
+    # Increment sender count
+    await db.increment_sender(message.author.id, message.author.display_name)
+
+    # Increment receiver count for each mentioned user
+    for mentioned_user in message.mentions:
+        if not mentioned_user.bot:
+            await db.increment_receiver(
+                mentioned_user.id, mentioned_user.display_name
+            )
+
+
+async def update_leaderboard(client: discord.Client):
+    """Update or post the leaderboard in the configured channel."""
+    leaderboard_channel_id = await db.get_config("leaderboard_channel_id")
+    if not leaderboard_channel_id:
+        return
+
+    channel = client.get_channel(int(leaderboard_channel_id))
+    if not channel:
+        return
+
+    # Build the leaderboard embed
+    embed = await build_leaderboard_embed()
+
+    # Check if we have an existing leaderboard message to edit
+    leaderboard_message_id = await db.get_config("leaderboard_message_id")
+    if leaderboard_message_id:
+        try:
+            message = await channel.fetch_message(int(leaderboard_message_id))
+            await message.edit(embed=embed)
+            return
+        except discord.NotFound:
+            pass
+
+    # Post a new leaderboard message
+    message = await channel.send(embed=embed)
+    await db.set_config("leaderboard_message_id", str(message.id))
+
+
+async def build_leaderboard_embed() -> discord.Embed:
+    """Build the leaderboard embed."""
+    embed = discord.Embed(
+        title="Spotted Leaderboard",
+        color=discord.Color.gold()
+    )
+
+    # Top spotters (sent most messages with mentions)
+    top_senders = await db.get_top_senders(LEADERBOARD_SIZE)
+    if top_senders:
+        sender_lines = []
+        for i, (user_id, username, count) in enumerate(top_senders, 1):
+            medal = get_medal(i)
+            sender_lines.append(f"{medal} **{username}** - {count} spots")
+        embed.add_field(
+            name="Most Spotters",
+            value="\n".join(sender_lines) or "No data yet",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Most Spotters",
+            value="No data yet",
+            inline=False
+        )
+
+    # Most spotted (received most mentions)
+    top_receivers = await db.get_top_receivers(LEADERBOARD_SIZE)
+    if top_receivers:
+        receiver_lines = []
+        for i, (user_id, username, count) in enumerate(top_receivers, 1):
+            medal = get_medal(i)
+            receiver_lines.append(f"{medal} **{username}** - {count} times")
+        embed.add_field(
+            name="Most Spotted",
+            value="\n".join(receiver_lines) or "No data yet",
+            inline=False
+        )
+    else:
+        embed.add_field(
+            name="Most Spotted",
+            value="No data yet",
+            inline=False
+        )
+
+    embed.set_footer(text="Updates every hour")
+    return embed
+
+
+def get_medal(position: int) -> str:
+    """Get medal emoji for leaderboard position."""
+    medals = {1: "1.", 2: "2.", 3: "3."}
+    return medals.get(position, f"{position}.")
+
+
+# Slash commands
+@bot.tree.command(name="setup", description="Configure the bot channels")
+@app_commands.describe(
+    channel_type="Which channel to configure",
+    channel="The channel to use"
+)
+@app_commands.choices(channel_type=[
+    app_commands.Choice(name="spotted", value="spotted"),
+    app_commands.Choice(name="leaderboard", value="leaderboard"),
+])
+@app_commands.default_permissions(administrator=True)
+async def setup(
+    interaction: discord.Interaction,
+    channel_type: str,
+    channel: discord.TextChannel
+):
+    if channel_type == "spotted":
+        await db.set_config("spotted_channel_id", str(channel.id))
+        await interaction.response.send_message(
+            f"Spotted channel set to {channel.mention}",
+            ephemeral=True
+        )
+    elif channel_type == "leaderboard":
+        await db.set_config("leaderboard_channel_id", str(channel.id))
+        # Clear old message ID so a new one gets posted
+        await db.set_config("leaderboard_message_id", "")
+        await interaction.response.send_message(
+            f"Leaderboard channel set to {channel.mention}",
+            ephemeral=True
+        )
+
+
+@bot.tree.command(name="leaderboard", description="Refresh the leaderboard")
+async def leaderboard(interaction: discord.Interaction):
+    await interaction.response.defer(ephemeral=True)
+    await update_leaderboard(bot)
+    await interaction.followup.send("Leaderboard updated!", ephemeral=True)
+
+
+@bot.tree.command(name="mystats", description="View your spotted stats")
+async def mystats(interaction: discord.Interaction):
+    messages_sent, times_mentioned = await db.get_user_stats(interaction.user.id)
+
+    embed = discord.Embed(
+        title=f"Stats for {interaction.user.display_name}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Spots Posted", value=str(messages_sent), inline=True)
+    embed.add_field(name="Times Spotted", value=str(times_mentioned), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+@bot.tree.command(name="stats", description="View another user's spotted stats")
+@app_commands.describe(user="The user to check stats for")
+async def stats(interaction: discord.Interaction, user: discord.Member):
+    messages_sent, times_mentioned = await db.get_user_stats(user.id)
+
+    embed = discord.Embed(
+        title=f"Stats for {user.display_name}",
+        color=discord.Color.blue()
+    )
+    embed.add_field(name="Spots Posted", value=str(messages_sent), inline=True)
+    embed.add_field(name="Times Spotted", value=str(times_mentioned), inline=True)
+
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+if __name__ == "__main__":
+    if not DISCORD_TOKEN:
+        print("Error: DISCORD_TOKEN not set in .env file")
+        exit(1)
+    bot.run(DISCORD_TOKEN)
