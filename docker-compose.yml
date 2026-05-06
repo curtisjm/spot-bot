@@ -1,0 +1,14 @@
+services:
+  spot-bot:
+    build: .
+    env_file:
+      - path: .env
+        required: false
+    environment:
+      DATABASE_PATH: /data/spot_bot.db
+    volumes:
+      - spot_bot_data:/data
+    restart: unless-stopped
+
+volumes:
+  spot_bot_data:
