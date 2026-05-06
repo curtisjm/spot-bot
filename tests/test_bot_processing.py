@@ -42,6 +42,28 @@ def reply_to(resolved_message):
     return SimpleNamespace(resolved=resolved_message)
 
 
+class FakeChannel:
+    def __init__(self, messages):
+        self._messages = messages
+
+    async def history(self, **kwargs):
+        for item in self._messages:
+            yield item
+
+
+def interaction(*, administrator=True):
+    return SimpleNamespace(
+        user=SimpleNamespace(
+            guild_permissions=SimpleNamespace(administrator=administrator)
+        )
+    )
+
+
+async def test_has_admin_permission_checks_runtime_permissions():
+    assert bot.has_admin_permission(interaction(administrator=True)) is True
+    assert bot.has_admin_permission(interaction(administrator=False)) is False
+
+
 async def test_process_spotted_message_upserts_valid_spotting(monkeypatch):
     calls = []
 
@@ -396,6 +418,28 @@ async def test_collect_spottings_from_messages_pairs_adjacent_history():
     assert spottings[0].message_id == 41
     assert spottings[0].photo_message_id == 40
     assert spottings[0].spotted_users == ((2, "One"),)
+
+
+async def test_collect_spottings_from_channel_history_reports_progress():
+    progress = []
+    channel = FakeChannel([
+        message(message_id=60),
+        message(message_id=61, attachments=[image_attachment()]),
+        message(message_id=62, mentions=[user(2, "One")], created_at=1020),
+    ])
+
+    async def on_progress(scanned_count, spotting_count):
+        progress.append((scanned_count, spotting_count))
+
+    spottings, scanned_count = await bot.collect_spottings_from_channel_history(
+        channel,
+        progress_interval=2,
+        progress_callback=on_progress,
+    )
+
+    assert scanned_count == 3
+    assert len(spottings) == 1
+    assert progress == [(2, 0), (3, 1)]
 
 
 async def test_parse_message_link_accepts_discord_message_links():

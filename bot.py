@@ -1,15 +1,19 @@
+import logging
 import re
 from dataclasses import dataclass
 from datetime import timedelta
+from pathlib import Path
 
 import discord
 from discord import app_commands
 from discord.ext import tasks
 import database as db
 from config import (
+    BACKFILL_PROGRESS_INTERVAL,
     DISCORD_TOKEN,
     LEADERBOARD_UPDATE_INTERVAL,
     LEADERBOARD_SIZE,
+    LOG_LEVEL,
 )
 from spotting import (
     PartialSpottingMessage,
@@ -21,6 +25,13 @@ from spotting import (
 
 
 ADJACENT_SPOTTING_WINDOW_SECONDS = 120
+HEALTHCHECK_PATH = Path("/tmp/spot-bot-ready")
+logging.basicConfig(
+    level=getattr(logging, LOG_LEVEL, logging.INFO),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+logger = logging.getLogger("spot_bot")
+
 MESSAGE_LINK_RE = re.compile(
     r"^https://(?:ptb\.|canary\.)?discord(?:app)?\.com/channels/"
     r"(?P<guild_id>\d+)/(?P<channel_id>\d+)/(?P<message_id>\d+)$"
@@ -134,7 +145,6 @@ class SpotBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
-        intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
         self.pending_spottings = PendingSpottings()
@@ -143,6 +153,7 @@ class SpotBot(discord.Client):
         await db.init_db()
         await self.tree.sync()
         self.update_leaderboard_task.start()
+        logger.info("Bot setup complete; slash commands synced")
 
     @tasks.loop(seconds=LEADERBOARD_UPDATE_INTERVAL)
     async def update_leaderboard_task(self):
@@ -150,8 +161,27 @@ class SpotBot(discord.Client):
         await self.wait_until_ready()
         await update_all_leaderboards(self)
 
+    @update_leaderboard_task.error
+    async def update_leaderboard_task_error(self, error):
+        logger.error(
+            "Unhandled leaderboard update task error",
+            exc_info=(type(error), error, error.__traceback__),
+        )
+
     async def on_ready(self):
-        print(f"Logged in as {self.user}")
+        HEALTHCHECK_PATH.write_text("ready\n", encoding="utf-8")
+        logger.info("Logged in as %s", self.user)
+
+    async def on_disconnect(self):
+        HEALTHCHECK_PATH.unlink(missing_ok=True)
+        logger.warning("Disconnected from Discord gateway")
+
+    async def on_resumed(self):
+        HEALTHCHECK_PATH.write_text("ready\n", encoding="utf-8")
+        logger.info("Discord gateway session resumed")
+
+    async def on_error(self, event_method, *args, **kwargs):
+        logger.exception("Unhandled Discord event error in %s", event_method)
 
 
 bot = SpotBot()
@@ -160,6 +190,25 @@ spot_group = app_commands.Group(
     description="Correct spotted leaderboard records",
 )
 bot.tree.add_command(spot_group)
+
+
+@bot.tree.error
+async def on_app_command_error(
+    interaction: discord.Interaction,
+    error: app_commands.AppCommandError,
+):
+    logger.error(
+        "Unhandled slash command error command=%s guild=%s user=%s",
+        getattr(getattr(interaction, "command", None), "qualified_name", "unknown"),
+        interaction.guild_id,
+        interaction.user.id if interaction.user else None,
+        exc_info=(type(error), error, error.__traceback__),
+    )
+    message = "Something went wrong while running that command. Check the bot logs."
+    if interaction.response.is_done():
+        await interaction.followup.send(message, ephemeral=True)
+    else:
+        await interaction.response.send_message(message, ephemeral=True)
 
 
 @bot.event
@@ -239,6 +288,15 @@ async def process_spotting_message(
     if spottings:
         for spotting in spottings:
             await db.upsert_spotting_message(spotting)
+            logger.info(
+                "Stored spotting guild=%s channel=%s message=%s photo=%s spotter=%s spotted=%s",
+                spotting.guild_id,
+                spotting.channel_id,
+                spotting.message_id,
+                spotting.photo_message_id,
+                spotting.spotter_id,
+                [spotted_id for spotted_id, _ in spotting.spotted_users],
+            )
         return True
 
     return False
@@ -251,6 +309,31 @@ def collect_spottings_from_messages(messages) -> list[SpottingMessage]:
     for message in messages:
         spottings.extend(resolve_spotting_messages(message, pending))
     return spottings
+
+
+async def collect_spottings_from_channel_history(
+    channel,
+    *,
+    progress_interval: int = BACKFILL_PROGRESS_INTERVAL,
+    progress_callback=None,
+) -> tuple[list[SpottingMessage], int]:
+    """Collect spotting records from channel history with optional progress callbacks."""
+    scanned_count = 0
+    spottings = []
+    pending = PendingSpottings()
+    last_reported_count = 0
+    progress_interval = max(1, progress_interval)
+    async for message in channel.history(limit=None, oldest_first=True):
+        scanned_count += 1
+        spottings.extend(resolve_spotting_messages(message, pending))
+        if progress_callback and scanned_count % progress_interval == 0:
+            await progress_callback(scanned_count, len(spottings))
+            last_reported_count = scanned_count
+
+    if progress_callback and scanned_count != last_reported_count:
+        await progress_callback(scanned_count, len(spottings))
+
+    return spottings, scanned_count
 
 
 def resolve_spotting_messages(
@@ -343,6 +426,11 @@ async def update_leaderboard(
 
     channel = client.get_channel(int(leaderboard_channel_id))
     if not channel:
+        logger.warning(
+            "Could not update leaderboard; channel not found guild=%s channel=%s",
+            guild_id,
+            leaderboard_channel_id,
+        )
         return
 
     # Build the leaderboard embed
@@ -357,9 +445,20 @@ async def update_leaderboard(
         try:
             message = await channel.fetch_message(int(leaderboard_message_id))
             await message.edit(embed=embed)
+            logger.info(
+                "Updated leaderboard guild=%s channel=%s message=%s",
+                guild_id,
+                leaderboard_channel_id,
+                leaderboard_message_id,
+            )
             return
         except discord.NotFound:
-            pass
+            logger.warning(
+                "Configured leaderboard message missing; posting replacement guild=%s channel=%s message=%s",
+                guild_id,
+                leaderboard_channel_id,
+                leaderboard_message_id,
+            )
 
     # Post a new leaderboard message
     message = await channel.send(embed=embed)
@@ -367,6 +466,12 @@ async def update_leaderboard(
         "leaderboard_message_id",
         str(message.id),
         guild_id=guild_id,
+    )
+    logger.info(
+        "Posted leaderboard guild=%s channel=%s message=%s",
+        guild_id,
+        leaderboard_channel_id,
+        message.id,
     )
 
 
@@ -435,6 +540,22 @@ def parse_message_link(message_link: str) -> MessageReference:
         channel_id=int(match.group("channel_id")),
         message_id=int(match.group("message_id")),
     )
+
+
+def has_admin_permission(interaction: discord.Interaction) -> bool:
+    permissions = getattr(getattr(interaction, "user", None), "guild_permissions", None)
+    return bool(getattr(permissions, "administrator", False))
+
+
+async def require_admin(interaction: discord.Interaction) -> bool:
+    if has_admin_permission(interaction):
+        return True
+
+    await interaction.response.send_message(
+        "This command requires administrator permissions.",
+        ephemeral=True,
+    )
+    return False
 
 
 async def fetch_message_from_link(
@@ -526,11 +647,20 @@ async def setup(
         )
         return
 
+    if not await require_admin(interaction):
+        return
+
     if channel_type == "spotted":
         await db.set_config(
             "spotted_channel_id",
             str(channel.id),
             guild_id=interaction.guild_id,
+        )
+        logger.info(
+            "Configured spotted channel guild=%s channel=%s user=%s",
+            interaction.guild_id,
+            channel.id,
+            interaction.user.id,
         )
         await interaction.response.send_message(
             f"Spotted channel set to {channel.mention}",
@@ -547,6 +677,12 @@ async def setup(
             "leaderboard_message_id",
             "",
             guild_id=interaction.guild_id,
+        )
+        logger.info(
+            "Configured leaderboard channel guild=%s channel=%s user=%s",
+            interaction.guild_id,
+            channel.id,
+            interaction.user.id,
         )
         await interaction.response.send_message(
             f"Leaderboard channel set to {channel.mention}",
@@ -614,6 +750,9 @@ async def spot_add(
         )
         return
 
+    if not await require_admin(interaction):
+        return
+
     await interaction.response.defer(ephemeral=True)
     try:
         message = await fetch_message_from_link(interaction, message_link)
@@ -640,6 +779,13 @@ async def spot_add(
         spotted_name=user.display_name,
         photo_message_id=photo_message_id_for_correction(message, existing),
     )
+    logger.info(
+        "Admin added spotted user guild=%s message=%s spotted=%s admin=%s",
+        interaction.guild_id,
+        message.id,
+        user.id,
+        interaction.user.id,
+    )
     await update_leaderboard(bot, guild_id=interaction.guild_id)
     await interaction.followup.send(
         f"Added {user.mention} to that spotting.",
@@ -665,6 +811,9 @@ async def spot_remove(
         )
         return
 
+    if not await require_admin(interaction):
+        return
+
     await interaction.response.defer(ephemeral=True)
     try:
         message = await fetch_message_from_link(interaction, message_link)
@@ -674,6 +823,13 @@ async def spot_remove(
         return
 
     await db.remove_spotted_user(message.id, user.id)
+    logger.info(
+        "Admin removed spotted user guild=%s message=%s spotted=%s admin=%s",
+        interaction.guild_id,
+        message.id,
+        user.id,
+        interaction.user.id,
+    )
     await update_leaderboard(bot, guild_id=interaction.guild_id)
     await interaction.followup.send(
         f"Removed {user.mention} from that spotting.",
@@ -695,6 +851,9 @@ async def spot_rescan(
         )
         return
 
+    if not await require_admin(interaction):
+        return
+
     await interaction.response.defer(ephemeral=True)
     try:
         message = await fetch_message_from_link(interaction, message_link)
@@ -708,6 +867,13 @@ async def spot_rescan(
     for spotting in spottings:
         await db.upsert_spotting_message(spotting)
 
+    logger.info(
+        "Admin rescanned spotting context guild=%s message=%s records=%s admin=%s",
+        interaction.guild_id,
+        message.id,
+        len(spottings),
+        interaction.user.id,
+    )
     await update_leaderboard(bot, guild_id=interaction.guild_id)
     await interaction.followup.send(
         f"Rescanned message and found {len(spottings)} spotting record(s).",
@@ -723,6 +889,9 @@ async def backfill(interaction: discord.Interaction):
             "Backfill can only be used in a server.",
             ephemeral=True
         )
+        return
+
+    if not await require_admin(interaction):
         return
 
     spotted_channel_id = await db.get_config(
@@ -746,14 +915,24 @@ async def backfill(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    # Fetch and process all valid spotting messages
-    message_count = 0
-    spottings = []
-    pending = PendingSpottings()
-    async for message in channel.history(limit=None, oldest_first=True):
-        resolved = resolve_spotting_messages(message, pending)
-        spottings.extend(resolved)
-        message_count += len(resolved)
+    logger.info(
+        "Backfill started guild=%s channel=%s admin=%s",
+        interaction.guild_id,
+        spotted_channel_id,
+        interaction.user.id,
+    )
+    await interaction.followup.send("Backfill started...", ephemeral=True)
+
+    async def report_progress(scanned_count: int, spotting_count: int):
+        await interaction.followup.send(
+            f"Backfill progress: scanned {scanned_count} messages, found {spotting_count} spotting records.",
+            ephemeral=True,
+        )
+
+    spottings, scanned_count = await collect_spottings_from_channel_history(
+        channel,
+        progress_callback=report_progress,
+    )
 
     await db.replace_guild_spotting_messages(interaction.guild_id, spottings)
 
@@ -761,8 +940,15 @@ async def backfill(interaction: discord.Interaction):
     await update_leaderboard(bot, guild_id=interaction.guild_id)
 
     await interaction.followup.send(
-        f"Backfill complete! Processed {message_count} messages with mentions.",
+        f"Backfill complete! Scanned {scanned_count} messages and rebuilt {len(spottings)} spotting records.",
         ephemeral=True
+    )
+    logger.info(
+        "Backfill complete guild=%s scanned=%s records=%s admin=%s",
+        interaction.guild_id,
+        scanned_count,
+        len(spottings),
+        interaction.user.id,
     )
 
 

@@ -89,6 +89,8 @@ Useful environment variables:
 - `DATABASE_PATH` (optional): SQLite file path, default `spot_bot.db`.
 - `LEADERBOARD_UPDATE_INTERVAL` (optional): seconds between automatic leaderboard refreshes, default `3600`.
 - `LEADERBOARD_SIZE` (optional): users shown per leaderboard section, default `10`.
+- `LOG_LEVEL` (optional): Python logging level, default `INFO`.
+- `BACKFILL_PROGRESS_INTERVAL` (optional): messages scanned between `/backfill` progress updates, default `500`.
 
 ## Docker Hosting
 
@@ -103,17 +105,42 @@ docker compose logs -f spot-bot
 
 The Compose service stores SQLite at `/data/spot_bot.db` on a named volume. Do not rely on the container writable layer for the database; it will be lost when the container is replaced.
 
-Back up the SQLite database regularly. One simple backup command:
+Before first deploy, validate the image:
 
 ```bash
-docker compose exec spot-bot python - <<'PY'
-import sqlite3
-src = sqlite3.connect('/data/spot_bot.db')
-dst = sqlite3.connect('/data/spot_bot.backup.db')
-src.backup(dst)
-dst.close()
-src.close()
-PY
+docker compose build
+docker compose run --rm spot-bot python -m py_compile bot.py database.py config.py spotting.py
+```
+
+The container has a Docker healthcheck that reports healthy after the bot reaches Discord's ready event. Use:
+
+```bash
+docker compose ps
+```
+
+Back up the SQLite database regularly:
+
+```bash
+docker compose exec spot-bot scripts/backup-db.sh
+```
+
+Backups are written under `/data/backups` in the named Docker volume. For a VPS, run that command from cron or a systemd timer and copy backups off the server periodically.
+
+## Deployment Checklist
+
+When upgrading an existing bot:
+
+1. Stop the old bot.
+2. Back up the SQLite database.
+3. Deploy the new container.
+4. Confirm `docker compose ps` shows the bot as healthy.
+5. Run `/backfill`.
+6. Check `/leaderboard`, `/mystats`, and one known spotting.
+
+The bot logs startup, leaderboard updates, spotting processing, admin corrections, backfill progress, and unhandled command/event errors. View logs with:
+
+```bash
+docker compose logs -f spot-bot
 ```
 
 ## Development
@@ -136,3 +163,4 @@ The main files are:
 - `spotting.py`: message parsing and spotting normalization.
 - `database.py`: SQLite schema, idempotent spotting storage, leaderboard queries, correction helpers.
 - `tests/`: parser, storage, and bot-processing tests.
+- `scripts/backup-db.sh`: SQLite online backup helper for Docker/VPS usage.
