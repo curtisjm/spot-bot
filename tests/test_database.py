@@ -80,3 +80,31 @@ async def test_deleting_message_removes_its_spottings(isolated_db):
     assert await db.get_top_senders() == []
     assert await db.get_top_receivers() == []
     assert await db.get_user_stats(1) == (0, 0)
+
+
+async def test_replace_all_spotting_messages_rebuilds_stats(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=10,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Old Poster",
+            spotted_users=((2, "Old"),),
+        )
+    )
+
+    await db.replace_all_spotting_messages([
+        SpottingMessage(
+            message_id=20,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=3,
+            spotter_name="New Poster",
+            spotted_users=((4, "New One"), (5, "New Two")),
+        )
+    ])
+
+    assert await db.get_top_senders() == [(3, "New Poster", 2)]
+    assert await db.get_top_receivers() == [(4, "New One", 1), (5, "New Two", 1)]
+    assert await db.get_user_stats(1) == (0, 0)

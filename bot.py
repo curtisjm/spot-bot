@@ -7,6 +7,7 @@ from config import (
     LEADERBOARD_UPDATE_INTERVAL,
     LEADERBOARD_SIZE,
 )
+from spotting import parse_spotting_message
 
 
 class SpotBot(discord.Client):
@@ -37,32 +38,55 @@ bot = SpotBot()
 
 @bot.event
 async def on_message(message: discord.Message):
-    # Ignore bot messages
     if message.author.bot:
         return
 
-    # Get the configured spotted channel
     spotted_channel_id = await db.get_config("spotted_channel_id")
     if not spotted_channel_id:
         return
 
-    # Only track messages in the spotted channel
+    await process_spotting_message(message, spotted_channel_id)
+
+
+@bot.event
+async def on_message_edit(before: discord.Message, after: discord.Message):
+    if after.author.bot:
+        return
+
+    spotted_channel_id = await db.get_config("spotted_channel_id")
+    if not spotted_channel_id:
+        return
+
+    await process_spotting_message(after, spotted_channel_id)
+
+
+@bot.event
+async def on_message_delete(message: discord.Message):
+    if message.author.bot:
+        return
+
+    spotted_channel_id = await db.get_config("spotted_channel_id")
+    if not spotted_channel_id or str(message.channel.id) != spotted_channel_id:
+        return
+
+    await db.delete_spotting_message(message.id)
+
+
+async def process_spotting_message(
+    message: discord.Message,
+    spotted_channel_id: str,
+) -> bool:
+    """Store or remove spotting data for a message in the spotted channel."""
     if str(message.channel.id) != spotted_channel_id:
-        return
+        return False
 
-    # Check if message has user mentions
-    if not message.mentions:
-        return
+    spotting = parse_spotting_message(message)
+    if not spotting:
+        await db.delete_spotting_message(message.id)
+        return False
 
-    # Increment sender count
-    await db.increment_sender(message.author.id, message.author.display_name)
-
-    # Increment receiver count for each mentioned user
-    for mentioned_user in message.mentions:
-        if not mentioned_user.bot:
-            await db.increment_receiver(
-                mentioned_user.id, mentioned_user.display_name
-            )
+    await db.upsert_spotting_message(spotting)
+    return True
 
 
 async def update_leaderboard(client: discord.Client):
@@ -100,13 +124,13 @@ async def build_leaderboard_embed() -> discord.Embed:
         color=discord.Color.gold()
     )
 
-    # Top spotters (sent most messages with mentions)
+    # Top spotters (spotted the most people)
     top_senders = await db.get_top_senders(LEADERBOARD_SIZE)
     if top_senders:
         sender_lines = []
         for i, (user_id, username, count) in enumerate(top_senders, 1):
             medal = get_medal(i)
-            sender_lines.append(f"{medal} **{username}** - {count} spots")
+            sender_lines.append(f"{medal} **{username}** - {count} people")
         embed.add_field(
             name="Most Spotters",
             value="\n".join(sender_lines) or "No data yet",
@@ -138,7 +162,7 @@ async def build_leaderboard_embed() -> discord.Embed:
             inline=False
         )
 
-    embed.set_footer(text="Updates every hour")
+    embed.set_footer(text=f"Updates every {LEADERBOARD_UPDATE_INTERVAL // 60} minutes")
     return embed
 
 
@@ -189,14 +213,14 @@ async def leaderboard(interaction: discord.Interaction):
 
 @bot.tree.command(name="mystats", description="View your spotted stats")
 async def mystats(interaction: discord.Interaction):
-    messages_sent, times_mentioned = await db.get_user_stats(interaction.user.id)
+    people_spotted, times_spotted = await db.get_user_stats(interaction.user.id)
 
     embed = discord.Embed(
         title=f"Stats for {interaction.user.display_name}",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Spots Posted", value=str(messages_sent), inline=True)
-    embed.add_field(name="Times Spotted", value=str(times_mentioned), inline=True)
+    embed.add_field(name="People Spotted", value=str(people_spotted), inline=True)
+    embed.add_field(name="Times Spotted", value=str(times_spotted), inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -204,14 +228,14 @@ async def mystats(interaction: discord.Interaction):
 @bot.tree.command(name="stats", description="View another user's spotted stats")
 @app_commands.describe(user="The user to check stats for")
 async def stats(interaction: discord.Interaction, user: discord.Member):
-    messages_sent, times_mentioned = await db.get_user_stats(user.id)
+    people_spotted, times_spotted = await db.get_user_stats(user.id)
 
     embed = discord.Embed(
         title=f"Stats for {user.display_name}",
         color=discord.Color.blue()
     )
-    embed.add_field(name="Spots Posted", value=str(messages_sent), inline=True)
-    embed.add_field(name="Times Spotted", value=str(times_mentioned), inline=True)
+    embed.add_field(name="People Spotted", value=str(people_spotted), inline=True)
+    embed.add_field(name="Times Spotted", value=str(times_spotted), inline=True)
 
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
@@ -237,24 +261,17 @@ async def backfill(interaction: discord.Interaction):
 
     await interaction.response.defer(ephemeral=True)
 
-    # Clear existing data
-    await db.clear_stats()
-
-    # Fetch and process all messages
+    # Fetch and process all valid spotting messages
     message_count = 0
+    spottings = []
     async for message in channel.history(limit=None):
-        if message.author.bot:
+        spotting = parse_spotting_message(message)
+        if not spotting:
             continue
-        if not message.mentions:
-            continue
-
-        await db.increment_sender(message.author.id, message.author.display_name)
-        for mentioned_user in message.mentions:
-            if not mentioned_user.bot:
-                await db.increment_receiver(
-                    mentioned_user.id, mentioned_user.display_name
-                )
+        spottings.append(spotting)
         message_count += 1
+
+    await db.replace_all_spotting_messages(spottings)
 
     # Update the leaderboard
     await update_leaderboard(bot)

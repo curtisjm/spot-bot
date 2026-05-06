@@ -67,38 +67,18 @@ async def upsert_spotting_message(spotting: SpottingMessage):
     """Store the current spotting state for one Discord message."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
-        await db.execute("""
-            INSERT INTO spot_messages (
-                message_id,
-                guild_id,
-                channel_id,
-                spotter_id,
-                spotter_name
-            )
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(message_id) DO UPDATE SET
-                guild_id = excluded.guild_id,
-                channel_id = excluded.channel_id,
-                spotter_id = excluded.spotter_id,
-                spotter_name = excluded.spotter_name
-        """, (
-            spotting.message_id,
-            spotting.guild_id,
-            spotting.channel_id,
-            spotting.spotter_id,
-            spotting.spotter_name,
-        ))
-        await db.execute(
-            "DELETE FROM spottings WHERE message_id = ?",
-            (spotting.message_id,)
-        )
-        await db.executemany("""
-            INSERT INTO spottings (message_id, spotted_id, spotted_name)
-            VALUES (?, ?, ?)
-        """, [
-            (spotting.message_id, spotted_id, spotted_name)
-            for spotted_id, spotted_name in spotting.spotted_users
-        ])
+        await _upsert_spotting_message(db, spotting)
+        await db.commit()
+
+
+async def replace_all_spotting_messages(spottings: list[SpottingMessage]):
+    """Replace all spotting data in one transaction."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("DELETE FROM spottings")
+        await db.execute("DELETE FROM spot_messages")
+        for spotting in spottings:
+            await _upsert_spotting_message(db, spotting)
         await db.commit()
 
 
@@ -111,6 +91,44 @@ async def delete_spotting_message(message_id: int):
             (message_id,)
         )
         await db.commit()
+
+
+async def _upsert_spotting_message(
+    db: aiosqlite.Connection,
+    spotting: SpottingMessage,
+):
+    await db.execute("""
+        INSERT INTO spot_messages (
+            message_id,
+            guild_id,
+            channel_id,
+            spotter_id,
+            spotter_name
+        )
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(message_id) DO UPDATE SET
+            guild_id = excluded.guild_id,
+            channel_id = excluded.channel_id,
+            spotter_id = excluded.spotter_id,
+            spotter_name = excluded.spotter_name
+    """, (
+        spotting.message_id,
+        spotting.guild_id,
+        spotting.channel_id,
+        spotting.spotter_id,
+        spotting.spotter_name,
+    ))
+    await db.execute(
+        "DELETE FROM spottings WHERE message_id = ?",
+        (spotting.message_id,)
+    )
+    await db.executemany("""
+        INSERT INTO spottings (message_id, spotted_id, spotted_name)
+        VALUES (?, ?, ?)
+    """, [
+        (spotting.message_id, spotted_id, spotted_name)
+        for spotted_id, spotted_name in spotting.spotted_users
+    ])
 
 
 async def get_top_senders(limit: int = 10) -> list[tuple[int, str, int]]:
