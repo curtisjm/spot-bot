@@ -82,6 +82,103 @@ async def test_deleting_message_removes_its_spottings(isolated_db):
     assert await db.get_user_stats(1) == (0, 0)
 
 
+async def test_deleting_photo_removes_adjacent_tag_spottings(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=11,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Poster",
+            spotted_users=((2, "One"),),
+            photo_message_id=10,
+        )
+    )
+
+    await db.delete_spotting_message(10)
+
+    assert await db.get_top_senders() == []
+    assert await db.get_top_receivers() == []
+
+
+async def test_add_and_remove_correction(isolated_db):
+    await db.add_spotted_user(
+        message_id=10,
+        guild_id=42,
+        channel_id=100,
+        spotter_id=1,
+        spotter_name="Poster",
+        spotted_id=2,
+        spotted_name="One",
+        photo_message_id=10,
+    )
+    await db.add_spotted_user(
+        message_id=10,
+        guild_id=42,
+        channel_id=100,
+        spotter_id=1,
+        spotter_name="Poster",
+        spotted_id=2,
+        spotted_name="One",
+        photo_message_id=10,
+    )
+
+    assert await db.get_top_senders() == [(1, "Poster", 1)]
+    assert await db.get_top_receivers() == [(2, "One", 1)]
+
+    await db.remove_spotted_user(10, 2)
+
+    assert await db.get_top_senders() == []
+    assert await db.get_top_receivers() == []
+
+
+async def test_remove_correction_by_photo_message_removes_adjacent_source(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=11,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Poster",
+            spotted_users=((2, "One"),),
+            photo_message_id=10,
+        )
+    )
+
+    await db.remove_spotted_user(10, 2)
+
+    assert await db.get_top_senders() == []
+    assert await db.get_top_receivers() == []
+
+
+async def test_same_person_counts_once_per_photo(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=11,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Poster",
+            spotted_users=((2, "One"),),
+            photo_message_id=10,
+        )
+    )
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=12,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Poster",
+            spotted_users=((2, "One"),),
+            photo_message_id=10,
+        )
+    )
+
+    assert await db.get_top_senders() == [(1, "Poster", 1)]
+    assert await db.get_top_receivers() == [(2, "One", 1)]
+
+
 async def test_replace_all_spotting_messages_rebuilds_stats(isolated_db):
     await db.upsert_spotting_message(
         SpottingMessage(

@@ -14,6 +14,7 @@ class SpottingMessage:
     spotter_id: int
     spotter_name: str
     spotted_users: tuple[tuple[int, str], ...]
+    photo_message_id: int | None = None
 
     @property
     def spot_count(self) -> int:
@@ -43,7 +44,11 @@ def parse_spotting_message(message: Any) -> SpottingMessage | None:
     if not _has_image_attachment(getattr(message, "attachments", ())):
         return None
 
-    spotted_users = _unique_non_bot_mentions(getattr(message, "mentions", ()))
+    author_id = int(message.author.id)
+    spotted_users = _unique_non_bot_mentions(
+        getattr(message, "mentions", ()),
+        excluded_user_id=author_id,
+    )
     if not spotted_users:
         return None
 
@@ -54,6 +59,7 @@ def parse_spotting_message(message: Any) -> SpottingMessage | None:
         spotter_id=int(message.author.id),
         spotter_name=message.author.display_name,
         spotted_users=tuple(spotted_users),
+        photo_message_id=int(message.id),
     )
 
 
@@ -66,7 +72,11 @@ def parse_partial_spotting_message(message: Any) -> PartialSpottingMessage | Non
         return None
 
     has_image = _has_image_attachment(getattr(message, "attachments", ()))
-    spotted_users = tuple(_unique_non_bot_mentions(getattr(message, "mentions", ())))
+    author_id = int(message.author.id)
+    spotted_users = tuple(_unique_non_bot_mentions(
+        getattr(message, "mentions", ()),
+        excluded_user_id=author_id,
+    ))
     if not has_image and not spotted_users:
         return None
 
@@ -101,12 +111,13 @@ def combine_partial_spottings(
         return None
 
     return SpottingMessage(
-        message_id=image_message.message_id,
+        message_id=tag_message.message_id,
         guild_id=image_message.guild_id,
         channel_id=image_message.channel_id,
         spotter_id=image_message.spotter_id,
         spotter_name=image_message.spotter_name,
         spotted_users=tag_message.spotted_users,
+        photo_message_id=image_message.message_id,
     )
 
 
@@ -132,13 +143,20 @@ def _has_image_attachment(attachments: Any) -> bool:
     return False
 
 
-def _unique_non_bot_mentions(mentions: Any) -> list[tuple[int, str]]:
+def _unique_non_bot_mentions(
+    mentions: Any,
+    excluded_user_id: int | None = None,
+) -> list[tuple[int, str]]:
     seen: set[int] = set()
     users: list[tuple[int, str]] = []
 
     for mentioned_user in mentions:
         user_id = int(mentioned_user.id)
-        if user_id in seen or getattr(mentioned_user, "bot", False):
+        if (
+            user_id in seen
+            or user_id == excluded_user_id
+            or getattr(mentioned_user, "bot", False)
+        ):
             continue
 
         seen.add(user_id)

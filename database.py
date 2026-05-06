@@ -12,9 +12,11 @@ async def init_db():
                 guild_id INTEGER NOT NULL,
                 channel_id INTEGER NOT NULL,
                 spotter_id INTEGER NOT NULL,
-                spotter_name TEXT NOT NULL
+                spotter_name TEXT NOT NULL,
+                photo_message_id INTEGER
             )
         """)
+        await _ensure_column(db, "spot_messages", "photo_message_id", "INTEGER")
         await db.execute("""
             CREATE TABLE IF NOT EXISTS spottings (
                 message_id INTEGER NOT NULL,
@@ -135,14 +137,51 @@ async def replace_guild_spotting_messages(
 
 
 async def delete_spotting_message(message_id: int):
-    """Remove all spotting data for one Discord message."""
+    """Remove spotting data sourced by or validated by one Discord message."""
     async with aiosqlite.connect(DATABASE_PATH) as db:
         await db.execute("PRAGMA foreign_keys = ON")
         await db.execute(
-            "DELETE FROM spot_messages WHERE message_id = ?",
-            (message_id,)
+            "DELETE FROM spot_messages WHERE message_id = ? OR photo_message_id = ?",
+            (message_id, message_id)
         )
         await db.commit()
+
+
+async def get_spotting_message(message_id: int) -> SpottingMessage | None:
+    """Fetch one stored spotting record and its tagged users."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        cursor = await db.execute("""
+            SELECT
+                message_id,
+                guild_id,
+                channel_id,
+                spotter_id,
+                spotter_name,
+                photo_message_id
+            FROM spot_messages
+            WHERE message_id = ?
+        """, (message_id,))
+        row = await cursor.fetchone()
+        if not row:
+            return None
+
+        cursor = await db.execute("""
+            SELECT spotted_id, spotted_name
+            FROM spottings
+            WHERE message_id = ?
+            ORDER BY spotted_id ASC
+        """, (message_id,))
+        spotted_users = tuple(await cursor.fetchall())
+
+        return SpottingMessage(
+            message_id=row[0],
+            guild_id=row[1],
+            channel_id=row[2],
+            spotter_id=row[3],
+            spotter_name=row[4],
+            spotted_users=spotted_users,
+            photo_message_id=row[5],
+        )
 
 
 async def _upsert_spotting_message(
@@ -155,32 +194,145 @@ async def _upsert_spotting_message(
             guild_id,
             channel_id,
             spotter_id,
-            spotter_name
+            spotter_name,
+            photo_message_id
         )
-        VALUES (?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?)
         ON CONFLICT(message_id) DO UPDATE SET
             guild_id = excluded.guild_id,
             channel_id = excluded.channel_id,
             spotter_id = excluded.spotter_id,
-            spotter_name = excluded.spotter_name
+            spotter_name = excluded.spotter_name,
+            photo_message_id = excluded.photo_message_id
     """, (
         spotting.message_id,
         spotting.guild_id,
         spotting.channel_id,
         spotting.spotter_id,
         spotting.spotter_name,
+        spotting.photo_message_id or spotting.message_id,
     ))
+    photo_message_id = spotting.photo_message_id or spotting.message_id
     await db.execute(
         "DELETE FROM spottings WHERE message_id = ?",
         (spotting.message_id,)
     )
-    await db.executemany("""
-        INSERT INTO spottings (message_id, spotted_id, spotted_name)
-        VALUES (?, ?, ?)
-    """, [
-        (spotting.message_id, spotted_id, spotted_name)
-        for spotted_id, spotted_name in spotting.spotted_users
-    ])
+    for spotted_id, spotted_name in spotting.spotted_users:
+        await db.execute("""
+            DELETE FROM spottings
+            WHERE spotted_id = ?
+                AND message_id IN (
+                    SELECT message_id
+                    FROM spot_messages
+                    WHERE photo_message_id = ?
+                        AND message_id != ?
+                )
+        """, (spotted_id, photo_message_id, spotting.message_id))
+        await db.execute("""
+            INSERT INTO spottings (message_id, spotted_id, spotted_name)
+            VALUES (?, ?, ?)
+        """, (spotting.message_id, spotted_id, spotted_name))
+
+
+async def add_spotted_user(
+    *,
+    message_id: int,
+    guild_id: int,
+    channel_id: int,
+    spotter_id: int,
+    spotter_name: str,
+    spotted_id: int,
+    spotted_name: str,
+    photo_message_id: int | None = None,
+):
+    """Admin correction: add one spotted user to a spotting record."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("""
+            INSERT INTO spot_messages (
+                message_id,
+                guild_id,
+                channel_id,
+                spotter_id,
+                spotter_name,
+                photo_message_id
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(message_id) DO UPDATE SET
+                guild_id = excluded.guild_id,
+                channel_id = excluded.channel_id,
+                spotter_id = excluded.spotter_id,
+                spotter_name = excluded.spotter_name,
+                photo_message_id = COALESCE(
+                    spot_messages.photo_message_id,
+                    excluded.photo_message_id
+                )
+        """, (
+            message_id,
+            guild_id,
+            channel_id,
+            spotter_id,
+            spotter_name,
+            photo_message_id or message_id,
+        ))
+        await db.execute("""
+            INSERT OR REPLACE INTO spottings (
+                message_id,
+                spotted_id,
+                spotted_name
+            )
+            VALUES (?, ?, ?)
+        """, (message_id, spotted_id, spotted_name))
+        await db.execute("""
+            DELETE FROM spottings
+            WHERE spotted_id = ?
+                AND message_id IN (
+                    SELECT message_id
+                    FROM spot_messages
+                    WHERE photo_message_id = ?
+                        AND message_id != ?
+                )
+        """, (spotted_id, photo_message_id or message_id, message_id))
+        await db.commit()
+
+
+async def remove_spotted_user(message_id: int, spotted_id: int):
+    """Admin correction: remove one spotted user from a spotting record."""
+    async with aiosqlite.connect(DATABASE_PATH) as db:
+        await db.execute("PRAGMA foreign_keys = ON")
+        await db.execute("""
+            DELETE FROM spottings
+            WHERE spotted_id = ?
+                AND message_id IN (
+                    SELECT message_id
+                    FROM spot_messages
+                    WHERE message_id = ? OR photo_message_id = ?
+                )
+        """, (spotted_id, message_id, message_id))
+        await db.execute("""
+            DELETE FROM spot_messages
+            WHERE NOT EXISTS (
+                SELECT 1
+                FROM spottings
+                WHERE spottings.message_id = spot_messages.message_id
+            )
+                AND (message_id = ? OR photo_message_id = ?)
+        """, (message_id, message_id))
+        await db.commit()
+
+
+async def _ensure_column(
+    db: aiosqlite.Connection,
+    table_name: str,
+    column_name: str,
+    column_type: str,
+):
+    cursor = await db.execute(f"PRAGMA table_info({table_name})")
+    columns = {row[1] for row in await cursor.fetchall()}
+    if column_name not in columns:
+        await db.execute(
+            f"ALTER TABLE {table_name} ADD COLUMN {column_name} {column_type}"
+        )
 
 
 async def get_top_senders(

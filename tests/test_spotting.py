@@ -43,7 +43,7 @@ def test_parses_unique_non_bot_mentions_from_image_message():
     spotted = user(2, "Spotted")
     bot = user(3, "Helper Bot", bot=True)
     msg = message(
-        mentions=[spotted, spotted, bot],
+        mentions=[spotted, spotted, bot, user(1, "Poster")],
         attachments=[attachment("photo.png", "image/png")],
     )
 
@@ -56,7 +56,17 @@ def test_parses_unique_non_bot_mentions_from_image_message():
     assert result.spotter_id == 1
     assert result.spotter_name == "Poster"
     assert result.spotted_users == ((2, "Spotted"),)
+    assert result.photo_message_id == 9001
     assert result.spot_count == 1
+
+
+def test_rejects_self_spots():
+    msg = message(
+        mentions=[user(1, "Poster")],
+        attachments=[attachment("photo.png", "image/png")],
+    )
+
+    assert parse_spotting_message(msg) is None
 
 
 @pytest.mark.parametrize(

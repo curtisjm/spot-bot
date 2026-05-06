@@ -2,7 +2,7 @@
 
 ## Overview
 
-Spot Bot tracks image-based "spottings" in a configured Discord channel. A valid spotting is either a non-bot message with both an image attachment and at least one non-bot user mention, or an adjacent photo-only/tag-only pair from the same author within two minutes.
+Spot Bot tracks image-based "spottings" in a configured Discord channel. A valid spotting is either a non-bot message with both an image attachment and at least one non-bot user mention, or a tag message from the photo author that is validated by a same-author photo within two minutes.
 
 The leaderboard has two rankings:
 
@@ -28,10 +28,12 @@ spot-bot/
 
 1. A user posts or edits a message in the configured spotted channel.
 2. `spotting.parse_spotting_message` accepts same-message image+tag spottings.
-3. If a message has only an image or only tags, `PendingSpottings` keeps it in memory for two minutes and combines it with the next complementary message from the same author in the same channel.
-4. Valid spottings are stored as one `spot_messages` row and one `spottings` row per tagged user. For adjacent pairs, the photo message ID is used as the canonical spotting message.
-5. Invalid edited messages and deleted messages remove any existing spotting rows for that Discord message.
-6. Leaderboards are computed from the event rows, so reprocessing a message is idempotent and multi-person photos count correctly.
+3. If a message has only an image or only tags, `PendingSpottings` keeps recent same-author messages in memory for two minutes. One photo can validate multiple tag messages in that window.
+4. A reply counts only when the author replies to their own photo with tags within two minutes.
+5. Self-spots are filtered out, and the same spotted person can only count once per photo.
+6. Valid spottings are stored as one `spot_messages` row and one `spottings` row per tagged user. For split photo/tag spottings, the tag-bearing message is the source `message_id`, and `photo_message_id` records the photo that made it valid.
+7. Editing a split tag message updates that spotting. Deleting the tag message removes that spotting. Deleting the photo removes split spottings validated by that photo.
+8. Leaderboards are computed from the event rows, so reprocessing a message is idempotent and multi-person photos count correctly.
 
 ## Database Schema
 
@@ -42,6 +44,7 @@ spot-bot/
 - `channel_id` - Spotted channel ID.
 - `spotter_id` - Poster user ID.
 - `spotter_name` - Poster display name at processing time.
+- `photo_message_id` - Discord message ID of the validating photo.
 
 **spottings** - One row per tagged person per spotting message.
 
@@ -74,6 +77,9 @@ Config keys:
 | `/leaderboard` | Manually refresh this server's leaderboard | Everyone |
 | `/mystats` | View your own stats in this server | Everyone |
 | `/stats @user` | View another user's stats in this server | Everyone |
+| `/spot add <message_link> @user` | Add a spotted user correction | Admin only |
+| `/spot remove <message_link> @user` | Remove a spotted user correction | Admin only |
+| `/spot rescan <message_link>` | Recompute a message and nearby two-minute context | Admin only |
 | `/backfill` | Rebuild this server's stats from channel history | Admin only |
 
 ## Discord Setup
