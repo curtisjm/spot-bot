@@ -108,3 +108,80 @@ async def test_replace_all_spotting_messages_rebuilds_stats(isolated_db):
     assert await db.get_top_senders() == [(3, "New Poster", 2)]
     assert await db.get_top_receivers() == [(4, "New One", 1), (5, "New Two", 1)]
     assert await db.get_user_stats(1) == (0, 0)
+
+
+async def test_config_values_are_scoped_by_guild(isolated_db):
+    await db.set_config("spotted_channel_id", "100", guild_id=42)
+    await db.set_config("spotted_channel_id", "200", guild_id=84)
+
+    assert await db.get_config("spotted_channel_id", guild_id=42) == "100"
+    assert await db.get_config("spotted_channel_id", guild_id=84) == "200"
+    assert await db.get_configured_guild_ids() == [42, 84]
+
+
+async def test_leaderboards_can_be_filtered_by_guild(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=10,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Guild A Poster",
+            spotted_users=((2, "Guild A Spotted"),),
+        )
+    )
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=20,
+            guild_id=84,
+            channel_id=200,
+            spotter_id=3,
+            spotter_name="Guild B Poster",
+            spotted_users=((4, "Guild B Spotted"),),
+        )
+    )
+
+    assert await db.get_top_senders(guild_id=42) == [(1, "Guild A Poster", 1)]
+    assert await db.get_top_receivers(guild_id=84) == [(4, "Guild B Spotted", 1)]
+    assert await db.get_user_stats(3, guild_id=42) == (0, 0)
+    assert await db.get_user_stats(3, guild_id=84) == (1, 0)
+
+
+async def test_replace_guild_spotting_messages_preserves_other_guilds(isolated_db):
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=10,
+            guild_id=42,
+            channel_id=100,
+            spotter_id=1,
+            spotter_name="Guild A Poster",
+            spotted_users=((2, "Guild A Spotted"),),
+        )
+    )
+    await db.upsert_spotting_message(
+        SpottingMessage(
+            message_id=20,
+            guild_id=84,
+            channel_id=200,
+            spotter_id=3,
+            spotter_name="Guild B Poster",
+            spotted_users=((4, "Guild B Spotted"),),
+        )
+    )
+
+    await db.replace_guild_spotting_messages(
+        42,
+        [
+            SpottingMessage(
+                message_id=30,
+                guild_id=42,
+                channel_id=100,
+                spotter_id=5,
+                spotter_name="New Guild A Poster",
+                spotted_users=((6, "New Guild A Spotted"),),
+            )
+        ],
+    )
+
+    assert await db.get_top_senders(guild_id=42) == [(5, "New Guild A Poster", 1)]
+    assert await db.get_top_senders(guild_id=84) == [(3, "Guild B Poster", 1)]

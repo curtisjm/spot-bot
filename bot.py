@@ -27,7 +27,7 @@ class SpotBot(discord.Client):
     async def update_leaderboard_task(self):
         """Periodically update the leaderboard."""
         await self.wait_until_ready()
-        await update_leaderboard(self)
+        await update_all_leaderboards(self)
 
     async def on_ready(self):
         print(f"Logged in as {self.user}")
@@ -38,10 +38,13 @@ bot = SpotBot()
 
 @bot.event
 async def on_message(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    spotted_channel_id = await db.get_config("spotted_channel_id")
+    spotted_channel_id = await db.get_config(
+        "spotted_channel_id",
+        guild_id=message.guild.id,
+    )
     if not spotted_channel_id:
         return
 
@@ -50,10 +53,13 @@ async def on_message(message: discord.Message):
 
 @bot.event
 async def on_message_edit(before: discord.Message, after: discord.Message):
-    if after.author.bot:
+    if after.author.bot or not after.guild:
         return
 
-    spotted_channel_id = await db.get_config("spotted_channel_id")
+    spotted_channel_id = await db.get_config(
+        "spotted_channel_id",
+        guild_id=after.guild.id,
+    )
     if not spotted_channel_id:
         return
 
@@ -62,10 +68,13 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
 
 @bot.event
 async def on_message_delete(message: discord.Message):
-    if message.author.bot:
+    if message.author.bot or not message.guild:
         return
 
-    spotted_channel_id = await db.get_config("spotted_channel_id")
+    spotted_channel_id = await db.get_config(
+        "spotted_channel_id",
+        guild_id=message.guild.id,
+    )
     if not spotted_channel_id or str(message.channel.id) != spotted_channel_id:
         return
 
@@ -89,9 +98,26 @@ async def process_spotting_message(
     return True
 
 
-async def update_leaderboard(client: discord.Client):
+async def update_all_leaderboards(client: discord.Client):
+    """Update leaderboards for all configured guilds."""
+    guild_ids = await db.get_configured_guild_ids()
+    if not guild_ids:
+        await update_leaderboard(client, guild_id=None)
+        return
+
+    for guild_id in guild_ids:
+        await update_leaderboard(client, guild_id=guild_id)
+
+
+async def update_leaderboard(
+    client: discord.Client,
+    guild_id: int | None = None,
+):
     """Update or post the leaderboard in the configured channel."""
-    leaderboard_channel_id = await db.get_config("leaderboard_channel_id")
+    leaderboard_channel_id = await db.get_config(
+        "leaderboard_channel_id",
+        guild_id=guild_id,
+    )
     if not leaderboard_channel_id:
         return
 
@@ -100,10 +126,13 @@ async def update_leaderboard(client: discord.Client):
         return
 
     # Build the leaderboard embed
-    embed = await build_leaderboard_embed()
+    embed = await build_leaderboard_embed(guild_id=guild_id)
 
     # Check if we have an existing leaderboard message to edit
-    leaderboard_message_id = await db.get_config("leaderboard_message_id")
+    leaderboard_message_id = await db.get_config(
+        "leaderboard_message_id",
+        guild_id=guild_id,
+    )
     if leaderboard_message_id:
         try:
             message = await channel.fetch_message(int(leaderboard_message_id))
@@ -114,10 +143,14 @@ async def update_leaderboard(client: discord.Client):
 
     # Post a new leaderboard message
     message = await channel.send(embed=embed)
-    await db.set_config("leaderboard_message_id", str(message.id))
+    await db.set_config(
+        "leaderboard_message_id",
+        str(message.id),
+        guild_id=guild_id,
+    )
 
 
-async def build_leaderboard_embed() -> discord.Embed:
+async def build_leaderboard_embed(guild_id: int | None = None) -> discord.Embed:
     """Build the leaderboard embed."""
     embed = discord.Embed(
         title="Spotted Leaderboard",
@@ -125,7 +158,7 @@ async def build_leaderboard_embed() -> discord.Embed:
     )
 
     # Top spotters (spotted the most people)
-    top_senders = await db.get_top_senders(LEADERBOARD_SIZE)
+    top_senders = await db.get_top_senders(LEADERBOARD_SIZE, guild_id=guild_id)
     if top_senders:
         sender_lines = []
         for i, (user_id, username, count) in enumerate(top_senders, 1):
@@ -144,7 +177,7 @@ async def build_leaderboard_embed() -> discord.Embed:
         )
 
     # Most spotted (received most mentions)
-    top_receivers = await db.get_top_receivers(LEADERBOARD_SIZE)
+    top_receivers = await db.get_top_receivers(LEADERBOARD_SIZE, guild_id=guild_id)
     if top_receivers:
         receiver_lines = []
         for i, (user_id, username, count) in enumerate(top_receivers, 1):
@@ -188,16 +221,35 @@ async def setup(
     channel_type: str,
     channel: discord.TextChannel
 ):
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Setup can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
     if channel_type == "spotted":
-        await db.set_config("spotted_channel_id", str(channel.id))
+        await db.set_config(
+            "spotted_channel_id",
+            str(channel.id),
+            guild_id=interaction.guild_id,
+        )
         await interaction.response.send_message(
             f"Spotted channel set to {channel.mention}",
             ephemeral=True
         )
     elif channel_type == "leaderboard":
-        await db.set_config("leaderboard_channel_id", str(channel.id))
+        await db.set_config(
+            "leaderboard_channel_id",
+            str(channel.id),
+            guild_id=interaction.guild_id,
+        )
         # Clear old message ID so a new one gets posted
-        await db.set_config("leaderboard_message_id", "")
+        await db.set_config(
+            "leaderboard_message_id",
+            "",
+            guild_id=interaction.guild_id,
+        )
         await interaction.response.send_message(
             f"Leaderboard channel set to {channel.mention}",
             ephemeral=True
@@ -207,13 +259,16 @@ async def setup(
 @bot.tree.command(name="leaderboard", description="Refresh the leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await update_leaderboard(bot)
+    await update_leaderboard(bot, guild_id=interaction.guild_id)
     await interaction.followup.send("Leaderboard updated!", ephemeral=True)
 
 
 @bot.tree.command(name="mystats", description="View your spotted stats")
 async def mystats(interaction: discord.Interaction):
-    people_spotted, times_spotted = await db.get_user_stats(interaction.user.id)
+    people_spotted, times_spotted = await db.get_user_stats(
+        interaction.user.id,
+        guild_id=interaction.guild_id,
+    )
 
     embed = discord.Embed(
         title=f"Stats for {interaction.user.display_name}",
@@ -228,7 +283,10 @@ async def mystats(interaction: discord.Interaction):
 @bot.tree.command(name="stats", description="View another user's spotted stats")
 @app_commands.describe(user="The user to check stats for")
 async def stats(interaction: discord.Interaction, user: discord.Member):
-    people_spotted, times_spotted = await db.get_user_stats(user.id)
+    people_spotted, times_spotted = await db.get_user_stats(
+        user.id,
+        guild_id=interaction.guild_id,
+    )
 
     embed = discord.Embed(
         title=f"Stats for {user.display_name}",
@@ -243,7 +301,17 @@ async def stats(interaction: discord.Interaction, user: discord.Member):
 @bot.tree.command(name="backfill", description="Import all existing messages from the spotted channel")
 @app_commands.default_permissions(administrator=True)
 async def backfill(interaction: discord.Interaction):
-    spotted_channel_id = await db.get_config("spotted_channel_id")
+    if interaction.guild_id is None:
+        await interaction.response.send_message(
+            "Backfill can only be used in a server.",
+            ephemeral=True
+        )
+        return
+
+    spotted_channel_id = await db.get_config(
+        "spotted_channel_id",
+        guild_id=interaction.guild_id,
+    )
     if not spotted_channel_id:
         await interaction.response.send_message(
             "No spotted channel configured. Use `/setup spotted #channel` first.",
@@ -271,10 +339,10 @@ async def backfill(interaction: discord.Interaction):
         spottings.append(spotting)
         message_count += 1
 
-    await db.replace_all_spotting_messages(spottings)
+    await db.replace_guild_spotting_messages(interaction.guild_id, spottings)
 
     # Update the leaderboard
-    await update_leaderboard(bot)
+    await update_leaderboard(bot, guild_id=interaction.guild_id)
 
     await interaction.followup.send(
         f"Backfill complete! Processed {message_count} messages with mentions.",
