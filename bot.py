@@ -7,7 +7,60 @@ from config import (
     LEADERBOARD_UPDATE_INTERVAL,
     LEADERBOARD_SIZE,
 )
-from spotting import parse_spotting_message
+from spotting import (
+    PartialSpottingMessage,
+    SpottingMessage,
+    combine_partial_spottings,
+    parse_partial_spotting_message,
+    parse_spotting_message,
+)
+
+
+ADJACENT_SPOTTING_WINDOW_SECONDS = 120
+
+
+class PendingSpottings:
+    """Tracks short-lived photo-only or tag-only messages for adjacent matching."""
+
+    def __init__(self, window_seconds: int = ADJACENT_SPOTTING_WINDOW_SECONDS):
+        self.window_seconds = window_seconds
+        self._items: dict[tuple[int, int, int], PartialSpottingMessage] = {}
+
+    def match_or_store(
+        self,
+        partial: PartialSpottingMessage,
+    ) -> PartialSpottingMessage | None:
+        self._expire(partial.created_at)
+        key = (partial.guild_id, partial.channel_id, partial.spotter_id)
+        existing = self._items.get(key)
+
+        if (
+            existing
+            and existing.has_image != partial.has_image
+            and self._within_window(existing, partial)
+        ):
+            self._items.pop(key, None)
+            return existing
+
+        self._items[key] = partial
+        return None
+
+    def discard_message(self, message_id: int):
+        for key, partial in list(self._items.items()):
+            if partial.message_id == message_id:
+                self._items.pop(key, None)
+
+    def _expire(self, now: float):
+        for key, partial in list(self._items.items()):
+            if abs(now - partial.created_at) > self.window_seconds:
+                self._items.pop(key, None)
+
+    def _within_window(
+        self,
+        first: PartialSpottingMessage,
+        second: PartialSpottingMessage,
+    ) -> bool:
+        return abs(second.created_at - first.created_at) <= self.window_seconds
 
 
 class SpotBot(discord.Client):
@@ -17,6 +70,7 @@ class SpotBot(discord.Client):
         intents.members = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self.pending_spottings = PendingSpottings()
 
     async def setup_hook(self):
         await db.init_db()
@@ -63,7 +117,11 @@ async def on_message_edit(before: discord.Message, after: discord.Message):
     if not spotted_channel_id:
         return
 
-    await process_spotting_message(after, spotted_channel_id)
+    await process_spotting_message(
+        after,
+        spotted_channel_id,
+        reconcile_existing=True,
+    )
 
 
 @bot.event
@@ -78,24 +136,62 @@ async def on_message_delete(message: discord.Message):
     if not spotted_channel_id or str(message.channel.id) != spotted_channel_id:
         return
 
+    bot.pending_spottings.discard_message(message.id)
     await db.delete_spotting_message(message.id)
 
 
 async def process_spotting_message(
     message: discord.Message,
     spotted_channel_id: str,
+    pending: PendingSpottings | None = None,
+    reconcile_existing: bool = False,
 ) -> bool:
     """Store or remove spotting data for a message in the spotted channel."""
     if str(message.channel.id) != spotted_channel_id:
         return False
 
-    spotting = parse_spotting_message(message)
-    if not spotting:
-        await db.delete_spotting_message(message.id)
-        return False
+    pending_spottings = pending or bot.pending_spottings
+    spotting = resolve_spotting_message(message, pending_spottings)
+    if spotting:
+        await db.upsert_spotting_message(spotting)
+        return True
 
-    await db.upsert_spotting_message(spotting)
-    return True
+    if reconcile_existing:
+        await db.delete_spotting_message(message.id)
+
+    return False
+
+
+def collect_spottings_from_messages(messages) -> list[SpottingMessage]:
+    """Resolve same-message and adjacent-message spottings from ordered history."""
+    pending = PendingSpottings()
+    spottings = []
+    for message in messages:
+        spotting = resolve_spotting_message(message, pending)
+        if spotting:
+            spottings.append(spotting)
+    return spottings
+
+
+def resolve_spotting_message(
+    message: discord.Message,
+    pending: PendingSpottings,
+) -> SpottingMessage | None:
+    spotting = parse_spotting_message(message)
+    if spotting:
+        pending.discard_message(message.id)
+        return spotting
+
+    partial = parse_partial_spotting_message(message)
+    if not partial:
+        pending.discard_message(message.id)
+        return None
+
+    previous = pending.match_or_store(partial)
+    if not previous:
+        return None
+
+    return combine_partial_spottings(previous, partial)
 
 
 async def update_all_leaderboards(client: discord.Client):
@@ -332,8 +428,9 @@ async def backfill(interaction: discord.Interaction):
     # Fetch and process all valid spotting messages
     message_count = 0
     spottings = []
-    async for message in channel.history(limit=None):
-        spotting = parse_spotting_message(message)
+    pending = PendingSpottings()
+    async for message in channel.history(limit=None, oldest_first=True):
+        spotting = resolve_spotting_message(message, pending)
         if not spotting:
             continue
         spottings.append(spotting)

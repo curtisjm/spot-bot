@@ -2,7 +2,7 @@
 
 ## Overview
 
-Spot Bot tracks image-based "spottings" in a configured Discord channel. A valid spotting is a non-bot message in the spotted channel with at least one image attachment and at least one non-bot user mention.
+Spot Bot tracks image-based "spottings" in a configured Discord channel. A valid spotting is either a non-bot message with both an image attachment and at least one non-bot user mention, or an adjacent photo-only/tag-only pair from the same author within two minutes.
 
 The leaderboard has two rankings:
 
@@ -27,10 +27,11 @@ spot-bot/
 ## Data Flow
 
 1. A user posts or edits a message in the configured spotted channel.
-2. `spotting.parse_spotting_message` rejects messages without an image attachment, without non-bot mentions, from bots, or outside a guild.
-3. Valid messages are stored as one `spot_messages` row and one `spottings` row per tagged user.
-4. Invalid edited messages and deleted messages remove any existing spotting rows for that Discord message.
-5. Leaderboards are computed from the event rows, so reprocessing a message is idempotent and multi-person photos count correctly.
+2. `spotting.parse_spotting_message` accepts same-message image+tag spottings.
+3. If a message has only an image or only tags, `PendingSpottings` keeps it in memory for two minutes and combines it with the next complementary message from the same author in the same channel.
+4. Valid spottings are stored as one `spot_messages` row and one `spottings` row per tagged user. For adjacent pairs, the photo message ID is used as the canonical spotting message.
+5. Invalid edited messages and deleted messages remove any existing spotting rows for that Discord message.
+6. Leaderboards are computed from the event rows, so reprocessing a message is idempotent and multi-person photos count correctly.
 
 ## Database Schema
 
