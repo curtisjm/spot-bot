@@ -363,6 +363,44 @@ async def test_process_spotted_message_does_not_count_reply_to_other_users_photo
     assert calls == []
 
 
+async def test_process_spotted_message_fetches_unresolved_reply_reference(monkeypatch):
+    calls = []
+    pending = bot.PendingSpottings()
+    photo = message(message_id=41, attachments=[image_attachment()], created_at=1000)
+    reply = message(
+        message_id=42,
+        mentions=[user(2, "One")],
+        created_at=1060,
+        reference=SimpleNamespace(message_id=41, resolved=None),
+    )
+
+    async def fake_fetch_message(message_id):
+        assert message_id == 41
+        return photo
+
+    reply.channel.fetch_message = fake_fetch_message
+
+    async def fake_upsert(spotting):
+        calls.append(spotting)
+
+    async def fake_delete(message_id):
+        raise AssertionError(f"unexpected delete for {message_id}")
+
+    monkeypatch.setattr(bot.db, "upsert_spotting_message", fake_upsert)
+    monkeypatch.setattr(bot.db, "delete_spotting_message", fake_delete)
+
+    processed = await bot.process_spotting_message(
+        reply,
+        spotted_channel_id="100",
+        pending=pending,
+    )
+
+    assert processed is True
+    assert len(calls) == 1
+    assert calls[0].message_id == 42
+    assert calls[0].photo_message_id == 41
+
+
 async def test_process_spotted_message_reconciles_edited_adjacent_tags(monkeypatch):
     calls = []
     deleted = []
@@ -406,6 +444,41 @@ async def test_process_spotted_message_reconciles_edited_adjacent_tags(monkeypat
     assert calls[0].message_id == 50
     assert calls[0].photo_message_id == 49
     assert calls[0].spotted_users == ((2, "One"), (3, "Two"))
+
+
+async def test_process_spotted_photo_edit_preserves_adjacent_tag_spottings(monkeypatch):
+    calls = []
+    deleted = []
+    pending = bot.PendingSpottings()
+
+    async def fake_upsert(spotting):
+        calls.append(spotting)
+
+    async def fake_delete(message_id):
+        deleted.append(message_id)
+
+    async def fake_get(message_id):
+        assert message_id == 49
+        return None
+
+    monkeypatch.setattr(bot.db, "upsert_spotting_message", fake_upsert)
+    monkeypatch.setattr(bot.db, "delete_spotting_message", fake_delete)
+    monkeypatch.setattr(bot.db, "get_spotting_message", fake_get)
+
+    processed = await bot.process_spotting_message(
+        message(
+            message_id=49,
+            attachments=[image_attachment()],
+            created_at=2000,
+        ),
+        spotted_channel_id="100",
+        pending=pending,
+        reconcile_existing=True,
+    )
+
+    assert processed is False
+    assert deleted == []
+    assert calls == []
 
 
 async def test_collect_spottings_from_messages_pairs_adjacent_history():
@@ -453,3 +526,72 @@ async def test_parse_message_link_accepts_discord_message_links():
 async def test_parse_message_link_rejects_non_message_links():
     with pytest.raises(ValueError):
         bot.parse_message_link("https://discord.com/channels/42/100")
+
+
+async def test_update_leaderboard_fetches_uncached_channel(monkeypatch):
+    sent = []
+    configs = {
+        "leaderboard_channel_id": "123",
+        "leaderboard_message_id": "",
+    }
+
+    class FakeChannel:
+        async def send(self, *, embed):
+            sent.append(embed)
+            return SimpleNamespace(id=456)
+
+    class FakeClient:
+        def get_channel(self, channel_id):
+            assert channel_id == 123
+            return None
+
+        async def fetch_channel(self, channel_id):
+            assert channel_id == 123
+            return FakeChannel()
+
+    async def fake_get_config(key, guild_id=None):
+        return configs.get(key)
+
+    async def fake_set_config(key, value, guild_id=None):
+        configs[key] = value
+
+    async def fake_build_leaderboard_embed(guild_id=None):
+        return SimpleNamespace(title="leaderboard")
+
+    monkeypatch.setattr(bot.db, "get_config", fake_get_config)
+    monkeypatch.setattr(bot.db, "set_config", fake_set_config)
+    monkeypatch.setattr(bot, "build_leaderboard_embed", fake_build_leaderboard_embed)
+
+    assert await bot.update_leaderboard(FakeClient(), guild_id=42) is True
+    assert len(sent) == 1
+    assert configs["leaderboard_message_id"] == "456"
+
+
+async def test_update_leaderboard_returns_false_when_send_fails(monkeypatch):
+    configs = {
+        "leaderboard_channel_id": "123",
+        "leaderboard_message_id": "",
+    }
+
+    class FakeResponse:
+        status = 403
+        reason = "Forbidden"
+
+    class FakeChannel:
+        async def send(self, *, embed):
+            raise bot.discord.Forbidden(FakeResponse(), "missing permissions")
+
+    class FakeClient:
+        def get_channel(self, channel_id):
+            return FakeChannel()
+
+    async def fake_get_config(key, guild_id=None):
+        return configs.get(key)
+
+    async def fake_build_leaderboard_embed(guild_id=None):
+        return SimpleNamespace(title="leaderboard")
+
+    monkeypatch.setattr(bot.db, "get_config", fake_get_config)
+    monkeypatch.setattr(bot, "build_leaderboard_embed", fake_build_leaderboard_embed)
+
+    assert await bot.update_leaderboard(FakeClient(), guild_id=42) is False

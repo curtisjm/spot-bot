@@ -277,12 +277,20 @@ async def process_spotting_message(
         existing = await db.get_spotting_message(message.id)
 
     spottings = resolve_spotting_messages(message, pending_spottings)
+    if not spottings:
+        partial = parse_partial_spotting_message(message)
+        if partial:
+            reply_spotting = await resolve_reply_spotting_from_fetch(message, partial)
+            if reply_spotting:
+                pending_spottings.discard_message(message.id)
+                spottings = [reply_spotting]
+
     if not spottings and existing:
         edited_spotting = resolve_existing_spotting_edit(message, existing)
         if edited_spotting:
             spottings = [edited_spotting]
 
-    if reconcile_existing:
+    if reconcile_existing and should_delete_for_reconcile(message, existing, spottings):
         await db.delete_spotting_message(message.id)
 
     if spottings:
@@ -300,6 +308,21 @@ async def process_spotting_message(
         return True
 
     return False
+
+
+def should_delete_for_reconcile(
+    message: discord.Message,
+    existing: SpottingMessage | None,
+    spottings: list[SpottingMessage],
+) -> bool:
+    if existing:
+        return True
+
+    if any(spotting.photo_message_id == message.id for spotting in spottings):
+        return True
+
+    partial = parse_partial_spotting_message(message)
+    return not (partial and partial.has_image)
 
 
 def collect_spottings_from_messages(messages) -> list[SpottingMessage]:
@@ -369,6 +392,52 @@ def resolve_reply_spotting(
     if not referenced_message:
         return None
 
+    return build_reply_spotting(referenced_message, partial)
+
+
+async def resolve_reply_spotting_from_fetch(
+    message: discord.Message,
+    partial: PartialSpottingMessage,
+) -> SpottingMessage | None:
+    if partial.has_image or not partial.spotted_users:
+        return None
+
+    reference = getattr(message, "reference", None)
+    if not reference or getattr(reference, "resolved", None):
+        return None
+
+    referenced_message_id = getattr(reference, "message_id", None)
+    if not referenced_message_id:
+        return None
+
+    channel = getattr(message, "channel", None)
+    if not hasattr(channel, "fetch_message"):
+        return None
+
+    try:
+        referenced_message = await channel.fetch_message(int(referenced_message_id))
+    except (
+        TypeError,
+        ValueError,
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException,
+    ):
+        logger.exception(
+            "Could not fetch replied-to message guild=%s channel=%s message=%s",
+            partial.guild_id,
+            partial.channel_id,
+            referenced_message_id,
+        )
+        return None
+
+    return build_reply_spotting(referenced_message, partial)
+
+
+def build_reply_spotting(
+    referenced_message: discord.Message,
+    partial: PartialSpottingMessage,
+) -> SpottingMessage | None:
     referenced = parse_partial_spotting_message(referenced_message)
     if not referenced or not referenced.has_image:
         return None
@@ -415,23 +484,27 @@ async def update_all_leaderboards(client: discord.Client):
 async def update_leaderboard(
     client: discord.Client,
     guild_id: int | None = None,
-):
+) -> bool:
     """Update or post the leaderboard in the configured channel."""
     leaderboard_channel_id = await db.get_config(
         "leaderboard_channel_id",
         guild_id=guild_id,
     )
     if not leaderboard_channel_id:
-        return
+        return False
 
-    channel = client.get_channel(int(leaderboard_channel_id))
+    channel = await get_channel_or_fetch(
+        client,
+        leaderboard_channel_id,
+        guild_id=guild_id,
+    )
     if not channel:
         logger.warning(
             "Could not update leaderboard; channel not found guild=%s channel=%s",
             guild_id,
             leaderboard_channel_id,
         )
-        return
+        return False
 
     # Build the leaderboard embed
     embed = await build_leaderboard_embed(guild_id=guild_id)
@@ -451,7 +524,14 @@ async def update_leaderboard(
                 leaderboard_channel_id,
                 leaderboard_message_id,
             )
-            return
+            return True
+        except ValueError:
+            logger.warning(
+                "Configured leaderboard message ID is invalid; posting replacement guild=%s channel=%s message=%s",
+                guild_id,
+                leaderboard_channel_id,
+                leaderboard_message_id,
+            )
         except discord.NotFound:
             logger.warning(
                 "Configured leaderboard message missing; posting replacement guild=%s channel=%s message=%s",
@@ -459,9 +539,26 @@ async def update_leaderboard(
                 leaderboard_channel_id,
                 leaderboard_message_id,
             )
+        except (discord.Forbidden, discord.HTTPException):
+            logger.exception(
+                "Could not edit leaderboard guild=%s channel=%s message=%s",
+                guild_id,
+                leaderboard_channel_id,
+                leaderboard_message_id,
+            )
+            return False
 
     # Post a new leaderboard message
-    message = await channel.send(embed=embed)
+    try:
+        message = await channel.send(embed=embed)
+    except (discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Could not post leaderboard guild=%s channel=%s",
+            guild_id,
+            leaderboard_channel_id,
+        )
+        return False
+
     await db.set_config(
         "leaderboard_message_id",
         str(message.id),
@@ -473,6 +570,38 @@ async def update_leaderboard(
         leaderboard_channel_id,
         message.id,
     )
+    return True
+
+
+async def get_channel_or_fetch(
+    client: discord.Client,
+    channel_id: str | int,
+    *,
+    guild_id: int | None = None,
+):
+    try:
+        channel_int = int(channel_id)
+    except (TypeError, ValueError):
+        logger.warning(
+            "Configured channel ID is invalid guild=%s channel=%s",
+            guild_id,
+            channel_id,
+        )
+        return None
+
+    channel = client.get_channel(channel_int)
+    if channel:
+        return channel
+
+    try:
+        return await client.fetch_channel(channel_int)
+    except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+        logger.exception(
+            "Could not fetch channel guild=%s channel=%s",
+            guild_id,
+            channel_id,
+        )
+        return None
 
 
 async def build_leaderboard_embed(guild_id: int | None = None) -> discord.Embed:
@@ -556,6 +685,24 @@ async def require_admin(interaction: discord.Interaction) -> bool:
         ephemeral=True,
     )
     return False
+
+
+async def send_followup_safely(
+    interaction: discord.Interaction,
+    content: str,
+    *,
+    ephemeral: bool = True,
+) -> bool:
+    try:
+        await interaction.followup.send(content, ephemeral=ephemeral)
+        return True
+    except discord.HTTPException:
+        logger.exception(
+            "Could not send followup guild=%s user=%s",
+            interaction.guild_id,
+            interaction.user.id if interaction.user else None,
+        )
+        return False
 
 
 async def fetch_message_from_link(
@@ -693,8 +840,14 @@ async def setup(
 @bot.tree.command(name="leaderboard", description="Refresh the leaderboard")
 async def leaderboard(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
-    await update_leaderboard(bot, guild_id=interaction.guild_id)
-    await interaction.followup.send("Leaderboard updated!", ephemeral=True)
+    updated = await update_leaderboard(bot, guild_id=interaction.guild_id)
+    if updated:
+        await interaction.followup.send("Leaderboard updated!", ephemeral=True)
+    else:
+        await interaction.followup.send(
+            "Could not update the leaderboard. Check the bot logs and channel permissions.",
+            ephemeral=True,
+        )
 
 
 @bot.tree.command(name="mystats", description="View your spotted stats")
@@ -905,7 +1058,11 @@ async def backfill(interaction: discord.Interaction):
         )
         return
 
-    channel = bot.get_channel(int(spotted_channel_id))
+    channel = await get_channel_or_fetch(
+        bot,
+        spotted_channel_id,
+        guild_id=interaction.guild_id,
+    )
     if not channel:
         await interaction.response.send_message(
             "Could not find the spotted channel.",
@@ -921,10 +1078,11 @@ async def backfill(interaction: discord.Interaction):
         spotted_channel_id,
         interaction.user.id,
     )
-    await interaction.followup.send("Backfill started...", ephemeral=True)
+    await send_followup_safely(interaction, "Backfill started...", ephemeral=True)
 
     async def report_progress(scanned_count: int, spotting_count: int):
-        await interaction.followup.send(
+        await send_followup_safely(
+            interaction,
             f"Backfill progress: scanned {scanned_count} messages, found {spotting_count} spotting records.",
             ephemeral=True,
         )
@@ -939,7 +1097,8 @@ async def backfill(interaction: discord.Interaction):
     # Update the leaderboard
     await update_leaderboard(bot, guild_id=interaction.guild_id)
 
-    await interaction.followup.send(
+    await send_followup_safely(
+        interaction,
         f"Backfill complete! Scanned {scanned_count} messages and rebuilt {len(spottings)} spotting records.",
         ephemeral=True
     )
