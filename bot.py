@@ -1,7 +1,7 @@
 import logging
 import re
 from dataclasses import dataclass
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import discord
@@ -337,6 +337,7 @@ def collect_spottings_from_messages(messages) -> list[SpottingMessage]:
 async def collect_spottings_from_channel_history(
     channel,
     *,
+    start_at: datetime | None = None,
     progress_interval: int = BACKFILL_PROGRESS_INTERVAL,
     progress_callback=None,
 ) -> tuple[list[SpottingMessage], int]:
@@ -346,7 +347,14 @@ async def collect_spottings_from_channel_history(
     pending = PendingSpottings()
     last_reported_count = 0
     progress_interval = max(1, progress_interval)
-    async for message in channel.history(limit=None, oldest_first=True):
+    history_kwargs = {
+        "limit": None,
+        "oldest_first": True,
+    }
+    if start_at:
+        history_kwargs["after"] = start_at - timedelta(microseconds=1)
+
+    async for message in channel.history(**history_kwargs):
         scanned_count += 1
         spottings.extend(resolve_spotting_messages(message, pending))
         if progress_callback and scanned_count % progress_interval == 0:
@@ -357,6 +365,15 @@ async def collect_spottings_from_channel_history(
         await progress_callback(scanned_count, len(spottings))
 
     return spottings, scanned_count
+
+
+def parse_backfill_start_date(start_date: str) -> datetime:
+    try:
+        parsed = datetime.strptime(start_date.strip(), "%Y-%m-%d")
+    except ValueError as exc:
+        raise ValueError("Start date must use YYYY-MM-DD format.") from exc
+
+    return parsed.replace(tzinfo=timezone.utc)
 
 
 def resolve_spotting_messages(
@@ -1034,9 +1051,15 @@ async def spot_rescan(
     )
 
 
-@bot.tree.command(name="backfill", description="Import all existing messages from the spotted channel")
+@bot.tree.command(name="backfill", description="Import existing messages from the spotted channel")
+@app_commands.describe(
+    start_date="Optional UTC start date to scan from, formatted YYYY-MM-DD",
+)
 @app_commands.default_permissions(administrator=True)
-async def backfill(interaction: discord.Interaction):
+async def backfill(
+    interaction: discord.Interaction,
+    start_date: str | None = None,
+):
     if interaction.guild_id is None:
         await interaction.response.send_message(
             "Backfill can only be used in a server.",
@@ -1046,6 +1069,14 @@ async def backfill(interaction: discord.Interaction):
 
     if not await require_admin(interaction):
         return
+
+    start_at = None
+    if start_date:
+        try:
+            start_at = parse_backfill_start_date(start_date)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
 
     spotted_channel_id = await db.get_config(
         "spotted_channel_id",
@@ -1073,12 +1104,20 @@ async def backfill(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
 
     logger.info(
-        "Backfill started guild=%s channel=%s admin=%s",
+        "Backfill started guild=%s channel=%s start_at=%s admin=%s",
         interaction.guild_id,
         spotted_channel_id,
+        start_at.isoformat() if start_at else None,
         interaction.user.id,
     )
-    await send_followup_safely(interaction, "Backfill started...", ephemeral=True)
+    if start_at:
+        await send_followup_safely(
+            interaction,
+            f"Backfill started from {start_at.date().isoformat()} UTC...",
+            ephemeral=True,
+        )
+    else:
+        await send_followup_safely(interaction, "Backfill started...", ephemeral=True)
 
     async def report_progress(scanned_count: int, spotting_count: int):
         await send_followup_safely(
@@ -1089,6 +1128,7 @@ async def backfill(interaction: discord.Interaction):
 
     spottings, scanned_count = await collect_spottings_from_channel_history(
         channel,
+        start_at=start_at,
         progress_callback=report_progress,
     )
 
@@ -1103,8 +1143,9 @@ async def backfill(interaction: discord.Interaction):
         ephemeral=True
     )
     logger.info(
-        "Backfill complete guild=%s scanned=%s records=%s admin=%s",
+        "Backfill complete guild=%s start_at=%s scanned=%s records=%s admin=%s",
         interaction.guild_id,
+        start_at.isoformat() if start_at else None,
         scanned_count,
         len(spottings),
         interaction.user.id,

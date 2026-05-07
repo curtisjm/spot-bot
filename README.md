@@ -46,7 +46,7 @@ Edits and deletes are reconciled:
 | `/spot add <message_link> @user` | Add a spotted user correction | Admin only |
 | `/spot remove <message_link> @user` | Remove a spotted user correction | Admin only |
 | `/spot rescan <message_link>` | Recompute a message and nearby two-minute context | Admin only |
-| `/backfill` | Rebuild this server's stats from channel history | Admin only |
+| `/backfill [start_date]` | Rebuild this server's stats from channel history, optionally from a UTC `YYYY-MM-DD` start date | Admin only |
 
 ## Setup
 
@@ -72,6 +72,12 @@ Then invite the bot to the server and run:
 /setup spotted #spotted-channel
 /setup leaderboard #spotted-leaderboard
 /backfill
+```
+
+To rebuild stats from a specific date forward, pass a UTC start date:
+
+```text
+/backfill start_date:2024-09-01
 ```
 
 ## Running Locally

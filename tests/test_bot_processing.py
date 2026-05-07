@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 import pytest
@@ -45,8 +46,10 @@ def reply_to(resolved_message):
 class FakeChannel:
     def __init__(self, messages):
         self._messages = messages
+        self.history_kwargs = None
 
     async def history(self, **kwargs):
+        self.history_kwargs = kwargs
         for item in self._messages:
             yield item
 
@@ -513,6 +516,41 @@ async def test_collect_spottings_from_channel_history_reports_progress():
     assert scanned_count == 3
     assert len(spottings) == 1
     assert progress == [(2, 0), (3, 1)]
+
+
+async def test_collect_spottings_from_channel_history_uses_start_date():
+    start_at = datetime(2024, 9, 1, tzinfo=timezone.utc)
+    channel = FakeChannel([
+        message(message_id=61, attachments=[image_attachment()]),
+        message(message_id=62, mentions=[user(2, "One")], created_at=1020),
+    ])
+
+    spottings, scanned_count = await bot.collect_spottings_from_channel_history(
+        channel,
+        start_at=start_at,
+    )
+
+    assert scanned_count == 2
+    assert len(spottings) == 1
+    assert channel.history_kwargs == {
+        "limit": None,
+        "oldest_first": True,
+        "after": start_at - timedelta(microseconds=1),
+    }
+
+
+async def test_parse_backfill_start_date_accepts_date_only():
+    assert bot.parse_backfill_start_date("2024-09-01") == datetime(
+        2024,
+        9,
+        1,
+        tzinfo=timezone.utc,
+    )
+
+
+async def test_parse_backfill_start_date_rejects_invalid_format():
+    with pytest.raises(ValueError, match="YYYY-MM-DD"):
+        bot.parse_backfill_start_date("09/01/2024")
 
 
 async def test_parse_message_link_accepts_discord_message_links():
